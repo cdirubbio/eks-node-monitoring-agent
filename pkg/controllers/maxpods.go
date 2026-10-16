@@ -27,8 +27,6 @@ const (
 	// TargetMaxPodsAnnotation is published on the node's CNINode by the EKS Auto IPAM
 	// controller with the kubelet max-pods its currently assigned IPs can back.
 	TargetMaxPodsAnnotation = "eks.amazonaws.com/target-max-pods"
-	// AppliedMaxPodsAnnotation acknowledges the max-pods value kubelet is running with.
-	AppliedMaxPodsAnnotation = "eks.amazonaws.com/applied-max-pods"
 
 	// MaxPodsCeiling is the highest max-pods this controller will ever apply, regardless
 	// of what is published. Setting an unbounded value through apiclient breaks kubelet.
@@ -127,7 +125,7 @@ func (c *maxPodsController) Register(ctx context.Context, m controllerruntime.Ma
 			predicate.Funcs{DeleteFunc: func(event.TypedDeleteEvent[client.Object]) bool { return false }},
 		)).
 		WithOptions(controller.Options{
-			// apply and acknowledge one value at a time.
+			// apply one value at a time.
 			MaxConcurrentReconciles: 1,
 		}).
 		Complete(c)
@@ -177,32 +175,26 @@ func (c *maxPodsController) Reconcile(ctx context.Context, req reconcile.Request
 		logger.V(2).Info("rate limiting max pods raise", "current", current, "desired", decision.desired, "after", decision.requeueAfter)
 		return reconcile.Result{RequeueAfter: decision.requeueAfter}, nil
 	}
-	if decision.apply {
-		state.Intent, state.AppliedAt = decision.desired, c.now()
-		// persist first: the commit restarts this agent, possibly before SetMaxPods returns.
-		if err := c.saveState(state); err != nil {
-			return reconcile.Result{}, err
-		}
-		logger.Info("applying max pods", "current", current, "desired", decision.desired, "target", target, "baseline", state.Baseline)
-		if err := c.settings.SetMaxPods(ctx, decision.desired); err != nil {
-			return reconcile.Result{}, fmt.Errorf("setting max pods to %d, %w", decision.desired, err)
-		}
-		if current, err = c.settings.GetMaxPods(ctx); err != nil {
-			return reconcile.Result{}, fmt.Errorf("verifying max pods setting, %w", err)
-		}
-		if current != decision.desired {
-			return reconcile.Result{}, fmt.Errorf("max pods setting is %d after applying %d", current, decision.desired)
-		}
+	if !decision.apply {
+		return reconcile.Result{}, nil
 	}
 
-	// acknowledge what kubelet is actually configured with, so IPAMC and operators can see it.
-	if cniNode.GetAnnotations()[AppliedMaxPodsAnnotation] != strconv.Itoa(int(current)) {
-		patch := client.MergeFrom(cniNode.DeepCopy())
-		cniNode.SetAnnotations(mergeMaps(cniNode.GetAnnotations(), map[string]string{AppliedMaxPodsAnnotation: strconv.Itoa(int(current))}))
-		if err := c.kubeClient.Patch(ctx, cniNode, patch); err != nil {
-			return reconcile.Result{}, fmt.Errorf("acknowledging applied max pods, %w", err)
-		}
+	state.Intent, state.AppliedAt = decision.desired, c.now()
+	// persist first: the commit restarts this agent, possibly before SetMaxPods returns.
+	if err := c.saveState(state); err != nil {
+		return reconcile.Result{}, err
 	}
+	logger.Info("applying max pods", "current", current, "desired", decision.desired, "target", target, "baseline", state.Baseline)
+	if err := c.settings.SetMaxPods(ctx, decision.desired); err != nil {
+		return reconcile.Result{}, fmt.Errorf("setting max pods to %d, %w", decision.desired, err)
+	}
+	if current, err = c.settings.GetMaxPods(ctx); err != nil {
+		return reconcile.Result{}, fmt.Errorf("verifying max pods setting, %w", err)
+	}
+	if current != decision.desired {
+		return reconcile.Result{}, fmt.Errorf("max pods setting is %d after applying %d", current, decision.desired)
+	}
+	// kubelet reports the applied value as the Node's allocatable pods, so nothing is written back.
 	return reconcile.Result{}, nil
 }
 
@@ -272,17 +264,6 @@ func parseApiclientMaxPods(out []byte) (int32, error) {
 		return 0, errors.New("settings.kubernetes.max-pods is not set")
 	}
 	return *resp.Settings.Kubernetes.MaxPods, nil
-}
-
-func mergeMaps(base, overlay map[string]string) map[string]string {
-	merged := make(map[string]string, len(base)+len(overlay))
-	for k, v := range base {
-		merged[k] = v
-	}
-	for k, v := range overlay {
-		merged[k] = v
-	}
-	return merged
 }
 
 func ptr[T any](v T) *T { return &v }

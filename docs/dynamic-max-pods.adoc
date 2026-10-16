@@ -18,7 +18,8 @@ publishes, so CPU-bound nodes with small pods are not capped by IP math they no 
 .. clamps the target to `[baseline, 110]`
 .. persists its intent
 .. runs `apiclient set settings.kubernetes.max-pods=<n>`
-. The agent acknowledges the value kubelet runs with in `eks.amazonaws.com/applied-max-pods`.
+. The agent writes nothing back to the API. Kubelet reports the applied value as the
+  Node's `status.allocatable.pods`.
 
 Raises are rate limited by `--dynamic-max-pods-min-interval` (default 2m). Lowers and
 restoring the baseline are never rate limited. A malformed target is ignored. Removing
@@ -27,12 +28,13 @@ the target annotation restores the baseline (kill switch).
 NOTE: Every `settings.kubernetes.*` commit restarts kubelet, kube-proxy, ipamd,
 aws-network-policy-agent, eks-pod-identity-agent, and this agent. The agent unit uses
 `KillMode=process`, so the `apiclient` child survives the restart. The restarted agent
-sees the setting already applied and only acknowledges it.
+sees the setting already applied and does nothing.
 
 == Dev cluster RBAC
 
 The managed `AmazonEKSAutoNodePolicy` does not grant the agent's identity
-(`eks-auto:node-monitoring-agent`) access to CNINodes. For a dev cluster:
+(`eks-auto:node-monitoring-agent`) access to CNINodes. The agent only reads its CNINode, so
+it needs no write access. For a dev cluster:
 
 [source,yaml]
 ----
@@ -43,7 +45,7 @@ metadata:
 rules:
 - apiGroups: ["eks.amazonaws.com"]
   resources: ["cninodes"]
-  verbs: ["get", "list", "watch", "patch"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -59,15 +61,13 @@ subjects:
   name: eks-auto:node-monitoring-agent
 ----
 
-For production, add the same rule to `nmaRules` in EKSAccessEntryServiceLambdaPolicies.
-Scope `patch` to the node's own CNINode, for example with a ValidatingAdmissionPolicy on
-the `node-name` user extra.
+For production, add the same read-only rule to `nmaRules` in EKSAccessEntryServiceLambdaPolicies.
 
 == Verifying on a node
 
 [source,bash]
 ----
-kubectl get cninode <node> -o jsonpath='{.metadata.annotations}'
+kubectl get cninode <node> -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/target-max-pods}'
 kubectl get node <node> -o jsonpath='{.status.allocatable.pods}'
 journalctl -u eks-node-monitoring-agent | grep -i "max pods"
 cat /var/lib/eks-node-monitoring-agent/max-pods.json

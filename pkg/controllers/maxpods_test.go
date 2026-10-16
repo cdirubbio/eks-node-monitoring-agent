@@ -64,12 +64,6 @@ func (h *maxPodsHarness) reconcile() reconcile.Result {
 	return result
 }
 
-func (h *maxPodsHarness) annotations() map[string]string {
-	cniNode := NewCNINodeMetadata()
-	require.NoError(h.t, h.controller.kubeClient.Get(context.Background(), types.NamespacedName{Name: testNodeName}, cniNode))
-	return cniNode.GetAnnotations()
-}
-
 func (h *maxPodsHarness) setTarget(value string) {
 	cniNode := NewCNINodeMetadata()
 	require.NoError(h.t, h.controller.kubeClient.Get(context.Background(), types.NamespacedName{Name: testNodeName}, cniNode))
@@ -78,7 +72,10 @@ func (h *maxPodsHarness) setTarget(value string) {
 	if value == "" {
 		delete(annotations, TargetMaxPodsAnnotation)
 	} else {
-		annotations = mergeMaps(annotations, map[string]string{TargetMaxPodsAnnotation: value})
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations[TargetMaxPodsAnnotation] = value
 	}
 	cniNode.SetAnnotations(annotations)
 	require.NoError(h.t, h.controller.kubeClient.Patch(context.Background(), cniNode, patch))
@@ -119,11 +116,10 @@ func TestParseApiclientMaxPods(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestMaxPodsRaisesAndAcknowledges(t *testing.T) {
+func TestMaxPodsRaises(t *testing.T) {
 	h := newMaxPodsHarness(t, 58, map[string]string{TargetMaxPodsAnnotation: "74"})
 	h.reconcile()
 	assert.Equal(t, []int32{74}, h.settings.sets)
-	assert.Equal(t, "74", h.annotations()[AppliedMaxPodsAnnotation])
 
 	state, err := h.controller.loadState()
 	require.NoError(t, err)
@@ -142,7 +138,6 @@ func TestMaxPodsRateLimitsRaisesButNotLowers(t *testing.T) {
 	h.setTarget("58")
 	h.reconcile()
 	assert.Equal(t, []int32{66, 58}, h.settings.sets)
-	assert.Equal(t, "58", h.annotations()[AppliedMaxPodsAnnotation])
 }
 
 func TestMaxPodsRestoresBaselineWhenTargetRemoved(t *testing.T) {
@@ -152,23 +147,20 @@ func TestMaxPodsRestoresBaselineWhenTargetRemoved(t *testing.T) {
 	h.setTarget("")
 	h.reconcile()
 	assert.Equal(t, []int32{74, 58}, h.settings.sets)
-	assert.Equal(t, "58", h.annotations()[AppliedMaxPodsAnnotation])
 }
 
-func TestMaxPodsAcknowledgesAfterRestart(t *testing.T) {
-	// the apiclient commit restarted the agent before it could acknowledge.
+func TestMaxPodsDoesNotReapplyAfterRestart(t *testing.T) {
+	// the apiclient commit restarted the agent after the setting was already applied.
 	h := newMaxPodsHarness(t, 74, map[string]string{TargetMaxPodsAnnotation: "74"})
 	require.NoError(t, h.controller.saveState(maxPodsState{Baseline: 58, Intent: 74, AppliedAt: h.now}))
 	h.reconcile()
 	assert.Empty(t, h.settings.sets)
-	assert.Equal(t, "74", h.annotations()[AppliedMaxPodsAnnotation])
 }
 
 func TestMaxPodsIgnoresMalformedTarget(t *testing.T) {
 	h := newMaxPodsHarness(t, 58, map[string]string{TargetMaxPodsAnnotation: "2500000000"})
 	h.reconcile()
 	assert.Empty(t, h.settings.sets)
-	assert.NotContains(t, h.annotations(), AppliedMaxPodsAnnotation)
 }
 
 func TestMaxPodsLeavesUntouchedNodesAlone(t *testing.T) {
