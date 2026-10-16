@@ -18,10 +18,12 @@ import (
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -61,6 +63,11 @@ var (
 	verbosity                    int
 
 	legacyNodeRBAC bool
+
+	dynamicMaxPods            bool
+	dynamicMaxPodsStatePath   string
+	dynamicMaxPodsMinInterval time.Duration
+	apiclientPath             string
 )
 
 const (
@@ -143,6 +150,18 @@ func run() error {
 		os.Setenv("DBUS_SYSTEM_BUS_ADDRESS", dbusAddress)
 	}
 
+	// Dynamic max-pods writes the Bottlerocket kubelet setting, so it is only meaningful on
+	// EKS Auto nodes, where the IPAM controller publishes a target on the CNINode.
+	enableDynamicMaxPods := dynamicMaxPods && slices.Contains(runtimeContext.Tags(), config.EKSAuto)
+
+	cacheOptions := cache.Options{}
+	if enableDynamicMaxPods {
+		// only cache this node's CNINode, not every CNINode in the cluster.
+		cacheOptions.ByObject = map[client.Object]cache.ByObject{
+			controllers.NewCNINodeMetadata(): {Field: fields.OneTermEqualSelector("metadata.name", hostname)},
+		}
+	}
+
 	logger.Info("initializing controller manager")
 	mgr, err := controllerruntime.NewManager(controllerruntime.GetConfigOrDie(), controllerruntime.Options{
 		Logger:                 log.FromContext(ctx),
@@ -151,6 +170,7 @@ func run() error {
 		BaseContext:            func() context.Context { return ctx },
 		Metrics:                server.Options{BindAddress: controllerMetricsAddress},
 		PprofBindAddress:       controllerPprofAddress,
+		Cache:                  cacheOptions,
 	})
 	if err != nil {
 		logger.Error(err, "failed to create controller manager")
@@ -408,6 +428,16 @@ func run() error {
 		return err
 	}
 
+	if enableDynamicMaxPods {
+		logger.Info("initializing max pods controller", "statePath", dynamicMaxPodsStatePath, "minInterval", dynamicMaxPodsMinInterval)
+		maxPodsController := controllers.NewMaxPodsController(mgr.GetClient(), hostname,
+			controllers.ApiclientMaxPodsSettings{Path: config.ToHostPath(apiclientPath)}, dynamicMaxPodsStatePath, dynamicMaxPodsMinInterval)
+		if err := maxPodsController.Register(ctx, mgr); err != nil {
+			logger.Error(err, "failed to register max pods controller")
+			return err
+		}
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		logger.Error(err, "failed to set up health check")
 		return err
@@ -470,6 +500,10 @@ func parseFlags() error {
 	flagSet.StringVar(&controllerMetricsAddress, "metrics-address", ":8080", "Address for the controller runtime metrics endpoint")
 	flagSet.StringVar(&controllerPprofAddress, "pprof-address", "", "Address for the controller runtime pprof endpoint (default disabled)")
 	flagSet.IntVarP(&verbosity, "verbosity", "v", 2, "Logging verbosity level")
+	flagSet.BoolVar(&dynamicMaxPods, "dynamic-max-pods", false, "Apply the max-pods target the EKS Auto IPAM controller publishes on this node's CNINode (EKS Auto only)")
+	flagSet.StringVar(&dynamicMaxPodsStatePath, "dynamic-max-pods-state-path", controllers.DefaultMaxPodsStatePath, "File that persists the boot max-pods baseline and the last applied value")
+	flagSet.DurationVar(&dynamicMaxPodsMinInterval, "dynamic-max-pods-min-interval", controllers.DefaultMaxPodsMinInterval, "Minimum time between max-pods raises; each change restarts kubelet")
+	flagSet.StringVar(&apiclientPath, "apiclient-path", "/usr/bin/apiclient", "Path to the Bottlerocket apiclient binary")
 	return flagSet.Parse(os.Args[1:])
 }
 
