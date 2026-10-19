@@ -150,8 +150,7 @@ func run() error {
 		os.Setenv("DBUS_SYSTEM_BUS_ADDRESS", dbusAddress)
 	}
 
-	// Dynamic max-pods writes the Bottlerocket kubelet setting, so it is only meaningful on
-	// EKS Auto nodes, where the IPAM controller publishes a target on the CNINode.
+	// Only EKS Auto nodes have a CNINode.
 	enableDynamicMaxPods := dynamicMaxPods && slices.Contains(runtimeContext.Tags(), config.EKSAuto)
 
 	cacheOptions := cache.Options{}

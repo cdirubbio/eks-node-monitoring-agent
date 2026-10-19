@@ -25,17 +25,14 @@ import (
 )
 
 const (
-	// MaxPodsCeiling is the highest max-pods this controller will ever apply, regardless
-	// of what is published. Setting an unbounded value through apiclient breaks kubelet.
+	// MaxPodsCeiling bounds what is applied regardless of status.maxPods; an unbounded value breaks kubelet.
 	MaxPodsCeiling = int32(110)
 
 	DefaultMaxPodsStatePath   = "/var/lib/eks-node-monitoring-agent/max-pods.json"
 	DefaultMaxPodsMinInterval = 2 * time.Minute
 )
 
-// CNINodeGVK identifies the EKS Auto CNINode. The EKS Auto IPAM controller publishes the
-// kubelet max-pods the node's assigned IPs can back in its status.maxPods. The controller
-// reads it from an unstructured object, so it does not need the internal CNINode Go types.
+// CNINodeGVK identifies the EKS Auto CNINode, read as unstructured to avoid depending on its Go types.
 var CNINodeGVK = schema.GroupVersionKind{Group: "eks.amazonaws.com", Version: "v1alpha1", Kind: "CNINode"}
 
 // NewCNINode returns an empty unstructured CNINode, usable for watches and cache options.
@@ -74,20 +71,17 @@ func maxPodsChanged(e event.TypedUpdateEvent[client.Object]) bool {
 // MaxPodsSettings reads and writes the kubelet max-pods setting on the host.
 type MaxPodsSettings interface {
 	GetMaxPods(ctx context.Context) (int32, error)
-	// SetMaxPods commits the setting. On Bottlerocket this restarts every kubernetes
-	// service, including this agent, so callers must persist intent before calling it.
+	// SetMaxPods commits the setting. The commit can restart this agent, so persist intent first.
 	SetMaxPods(ctx context.Context, maxPods int32) error
 }
 
 // maxPodsState survives agent restarts, including the one triggered by SetMaxPods.
 type maxPodsState struct {
-	// Baseline is the max-pods the node booted with (set by Karpenter user data), recorded
-	// before this controller first changes it. It is both the floor and the value restored
-	// when status.maxPods is unset.
+	// Baseline is the boot max-pods, recorded before the first change: the floor, and the value
+	// restored when status.maxPods is unset.
 	Baseline int32 `json:"baseline"`
-	// Intent is the last value this controller asked apiclient to apply.
-	Intent int32 `json:"intent,omitempty"`
-	// AppliedAt is when Intent was requested; it rate limits raises.
+	Intent   int32 `json:"intent,omitempty"`
+	// AppliedAt rate limits raises.
 	AppliedAt time.Time `json:"appliedAt,omitempty"`
 }
 
@@ -97,9 +91,8 @@ type maxPodsDecision struct {
 	requeueAfter time.Duration
 }
 
-// decideMaxPods is the pure policy: clamp the published target to [baseline, ceiling],
-// restore the baseline when no target is published, apply lowers right away, and rate
-// limit raises so repeated kubelet restarts cannot pile up.
+// decideMaxPods clamps the target to [baseline, ceiling], restores the baseline when there is
+// no target, and rate limits raises (each change restarts kubelet); lowers apply right away.
 func decideMaxPods(state maxPodsState, current int32, target *int32, now time.Time, minInterval time.Duration) maxPodsDecision {
 	desired := state.Baseline
 	if target != nil {
@@ -151,7 +144,6 @@ func (c *maxPodsController) Register(ctx context.Context, m controllerruntime.Ma
 			},
 		)).
 		WithOptions(controller.Options{
-			// apply one value at a time.
 			MaxConcurrentReconciles: 1,
 		}).
 		Complete(c)
@@ -168,7 +160,6 @@ func (c *maxPodsController) Reconcile(ctx context.Context, req reconcile.Request
 	var target *int32
 	value, ok, err := cniNodeMaxPods(cniNode)
 	if err != nil {
-		// never act on a value we cannot trust; leave kubelet where it is.
 		logger.Error(err, "ignoring malformed CNINode status.maxPods")
 		return reconcile.Result{}, nil
 	}
@@ -187,7 +178,6 @@ func (c *maxPodsController) Reconcile(ctx context.Context, req reconcile.Request
 	}
 	if state.Baseline == 0 {
 		if target == nil {
-			// nothing published and nothing changed yet; no reason to touch disk.
 			return reconcile.Result{}, nil
 		}
 		state.Baseline = current
@@ -220,7 +210,6 @@ func (c *maxPodsController) Reconcile(ctx context.Context, req reconcile.Request
 	if current != decision.desired {
 		return reconcile.Result{}, fmt.Errorf("max pods setting is %d after applying %d", current, decision.desired)
 	}
-	// kubelet reports the applied value as the Node's allocatable pods, so nothing is written back.
 	return reconcile.Result{}, nil
 }
 

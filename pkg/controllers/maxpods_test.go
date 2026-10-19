@@ -39,8 +39,7 @@ type maxPodsHarness struct {
 	now        time.Time
 }
 
-// newMaxPodsHarness creates this node's CNINode with status.maxPods set to maxPods (any
-// JSON value, nil for unset) and kubelet configured with current max-pods.
+// newMaxPodsHarness sets status.maxPods to maxPods (nil for unset) and kubelet max-pods to current.
 func newMaxPodsHarness(t *testing.T, current int32, maxPods any) *maxPodsHarness {
 	scheme := runtime.NewScheme()
 	scheme.AddKnownTypeWithName(CNINodeGVK, &unstructured.Unstructured{})
@@ -68,7 +67,6 @@ func (h *maxPodsHarness) reconcile() reconcile.Result {
 	return result
 }
 
-// setMaxPods sets status.maxPods as the IPAM controller would; nil unsets it.
 func (h *maxPodsHarness) setMaxPods(maxPods any) {
 	cniNode := NewCNINode()
 	require.NoError(h.t, h.controller.kubeClient.Get(context.Background(), types.NamespacedName{Name: testNodeName}, cniNode))
