@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"reflect"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -24,10 +25,6 @@ import (
 )
 
 const (
-	// TargetMaxPodsAnnotation is published on the node's CNINode by the EKS Auto IPAM
-	// controller with the kubelet max-pods its currently assigned IPs can back.
-	TargetMaxPodsAnnotation = "eks.amazonaws.com/target-max-pods"
-
 	// MaxPodsCeiling is the highest max-pods this controller will ever apply, regardless
 	// of what is published. Setting an unbounded value through apiclient breaks kubelet.
 	MaxPodsCeiling = int32(110)
@@ -36,15 +33,42 @@ const (
 	DefaultMaxPodsMinInterval = 2 * time.Minute
 )
 
-// CNINodeGVK identifies the EKS Auto CNINode. The controller only reads metadata, so it
-// does not need the CNINode Go types.
+// CNINodeGVK identifies the EKS Auto CNINode. The EKS Auto IPAM controller publishes the
+// kubelet max-pods the node's assigned IPs can back in its status.maxPods. The controller
+// reads it from an unstructured object, so it does not need the internal CNINode Go types.
 var CNINodeGVK = schema.GroupVersionKind{Group: "eks.amazonaws.com", Version: "v1alpha1", Kind: "CNINode"}
 
-// NewCNINodeMetadata returns an empty metadata-only CNINode, usable for watches and cache options.
-func NewCNINodeMetadata() *metav1.PartialObjectMetadata {
-	obj := &metav1.PartialObjectMetadata{}
+// NewCNINode returns an empty unstructured CNINode, usable for watches and cache options.
+func NewCNINode() *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(CNINodeGVK)
 	return obj
+}
+
+// cniNodeMaxPods reads status.maxPods. ok is false when it is unset; err is set when the
+// value is not a usable max-pods.
+func cniNodeMaxPods(obj *unstructured.Unstructured) (value int32, ok bool, err error) {
+	raw, found, err := unstructured.NestedInt64(obj.Object, "status", "maxPods")
+	if err != nil || !found {
+		return 0, false, err
+	}
+	if raw <= 0 || raw > math.MaxInt32 {
+		return 0, false, fmt.Errorf("status.maxPods %d is out of range", raw)
+	}
+	return int32(raw), true, nil
+}
+
+// maxPodsChanged passes CNINode updates only when status.maxPods changes; IPAM rewrites the
+// rest of the status on every IP allocation.
+func maxPodsChanged(e event.TypedUpdateEvent[client.Object]) bool {
+	oldObj, oldOK := e.ObjectOld.(*unstructured.Unstructured)
+	newObj, newOK := e.ObjectNew.(*unstructured.Unstructured)
+	if !oldOK || !newOK {
+		return true
+	}
+	oldValue, _, _ := unstructured.NestedFieldNoCopy(oldObj.Object, "status", "maxPods")
+	newValue, _, _ := unstructured.NestedFieldNoCopy(newObj.Object, "status", "maxPods")
+	return !reflect.DeepEqual(oldValue, newValue)
 }
 
 // MaxPodsSettings reads and writes the kubelet max-pods setting on the host.
@@ -59,7 +83,7 @@ type MaxPodsSettings interface {
 type maxPodsState struct {
 	// Baseline is the max-pods the node booted with (set by Karpenter user data), recorded
 	// before this controller first changes it. It is both the floor and the value restored
-	// when the target annotation is removed.
+	// when status.maxPods is unset.
 	Baseline int32 `json:"baseline"`
 	// Intent is the last value this controller asked apiclient to apply.
 	Intent int32 `json:"intent,omitempty"`
@@ -101,7 +125,8 @@ type maxPodsController struct {
 	now         func() time.Time
 }
 
-// NewMaxPodsController applies the IPAM controller's per-node max-pods target to kubelet.
+// NewMaxPodsController applies the max-pods the IPAM controller publishes in this node's
+// CNINode status.maxPods to kubelet.
 func NewMaxPodsController(kubeClient client.Client, nodeName string, settings MaxPodsSettings, statePath string, minInterval time.Duration) *maxPodsController {
 	return &maxPodsController{
 		kubeClient:  kubeClient,
@@ -116,13 +141,14 @@ func NewMaxPodsController(kubeClient client.Client, nodeName string, settings Ma
 func (c *maxPodsController) Register(ctx context.Context, m controllerruntime.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("max-pods").
-		For(NewCNINodeMetadata()).
+		For(NewCNINode()).
 		WithEventFilter(predicate.And(
 			// only action the CNINode corresponding to the controller node.
 			predicate.NewPredicateFuncs(func(object client.Object) bool { return object.GetName() == c.nodeName }),
-			// IPAMC writes status constantly; only the annotations carry the target.
-			predicate.AnnotationChangedPredicate{},
-			predicate.Funcs{DeleteFunc: func(event.TypedDeleteEvent[client.Object]) bool { return false }},
+			predicate.Funcs{
+				UpdateFunc: maxPodsChanged,
+				DeleteFunc: func(event.TypedDeleteEvent[client.Object]) bool { return false },
+			},
 		)).
 		WithOptions(controller.Options{
 			// apply one value at a time.
@@ -134,20 +160,20 @@ func (c *maxPodsController) Register(ctx context.Context, m controllerruntime.Ma
 func (c *maxPodsController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	logger := log.FromContext(ctx).WithValues("cninode", req.Name)
 
-	cniNode := NewCNINodeMetadata()
+	cniNode := NewCNINode()
 	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: req.Name}, cniNode); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
 	var target *int32
-	if raw, ok := cniNode.GetAnnotations()[TargetMaxPodsAnnotation]; ok {
-		value, err := strconv.ParseInt(raw, 10, 32)
-		if err != nil || value <= 0 {
-			// never act on a value we cannot trust; leave kubelet where it is.
-			logger.Error(err, "ignoring malformed target max pods", "value", raw)
-			return reconcile.Result{}, nil
-		}
-		target = ptr(int32(value))
+	value, ok, err := cniNodeMaxPods(cniNode)
+	if err != nil {
+		// never act on a value we cannot trust; leave kubelet where it is.
+		logger.Error(err, "ignoring malformed CNINode status.maxPods")
+		return reconcile.Result{}, nil
+	}
+	if ok {
+		target = ptr(value)
 	}
 
 	current, err := c.settings.GetMaxPods(ctx)

@@ -1,40 +1,47 @@
-= Dynamic max-pods (PoC)
+= Dynamic max-pods
 
-On EKS Auto nodes that receive /28 prefixes, the EKS Auto IPAM controller (IPAMC) can
-assign more pod IPs than the secondary-IP max-pods formula allows (58 on a t4g.xlarge).
-With `--dynamic-max-pods`, the agent applies the per-node max-pods target that IPAMC
-publishes, so CPU-bound nodes with small pods are not capped by IP math they no longer need.
+EKS Auto Mode sizes kubelet max-pods as `min((IPv4 addresses per ENI - 1) * ENIs, 110)`
+(56 on a t4g.xlarge). On nodes that receive /28 prefixes, the EKS Auto IPAM controller
+(IPAMC) can back far more pods than that. With dynamic max-pods, a node's max-pods follows
+the IPs IPAMC actually assigns, so CPU-bound nodes with small pods are not capped by IP
+math they no longer need.
 
 == How it works
 
-. IPAMC (feature gate `DynamicMaxPods=true`) warms IPs past the secondary-IP cap on
-  prefix nodes. After each CNINode status write, it publishes
-  `eks.amazonaws.com/target-max-pods` = `clamp(availableIPs + 2, baseline, 110)` on the
-  node's CNINode.
-. The agent watches only its own CNINode, metadata only (`metadata.name=<node>`).
-. On a target change, the agent:
+. A NodeClass opts in with `spec.advancedNetworking.dynamicMaxPods: true`.
+. Karpenter adds `dynamic-max-pods = true` to `[settings.advanced-networking]` in the node's
+  user data. The agent's systemd drop-in passes `--dynamic-max-pods` only when that setting
+  is true.
+. IPAMC creates the node's CNINode with `spec.dynamicMaxPods: true`, warms /28s past the
+  static limit, and sets `status.maxPods` to the assigned pod IP count. It is floored at the
+  max-pods the node launched with and capped at 110. It is written in the same status update
+  as the IPs that back it.
+. The agent watches only its own CNINode (`metadata.name=<node>`) and reconciles only when
+  `status.maxPods` changes. On a change it:
 .. records the boot max-pods as the baseline in `--dynamic-max-pods-state-path`
    (first change only)
-.. clamps the target to `[baseline, 110]`
+.. clamps the value to `[baseline, 110]`
 .. persists its intent
 .. runs `apiclient set settings.kubernetes.max-pods=<n>`
-. The agent writes nothing back to the API. Kubelet reports the applied value as the
-  Node's `status.allocatable.pods`.
+. The agent writes nothing back to the API. Kubelet reports the applied value as the Node's
+  `status.allocatable.pods`.
 
 Raises are rate limited by `--dynamic-max-pods-min-interval` (default 2m). Lowers and
-restoring the baseline are never rate limited. A malformed target is ignored. Removing
-the target annotation restores the baseline (kill switch).
+restoring the baseline are never rate limited. A malformed `status.maxPods` is ignored.
+When `status.maxPods` is unset, for example because the IPAMC `DynamicMaxPods` feature gate
+was turned off, the agent restores the baseline.
 
-NOTE: Every `settings.kubernetes.*` commit restarts kubelet, kube-proxy, ipamd,
-aws-network-policy-agent, eks-pod-identity-agent, and this agent. The agent unit uses
-`KillMode=process`, so the `apiclient` child survives the restart. The restarted agent
-sees the setting already applied and does nothing.
+NOTE: A `settings.kubernetes.max-pods` commit restarts kubelet. Until the AMI scopes that
+setting to kubelet, it also restarts the other services registered under `kubernetes`,
+including this agent. The agent unit uses `KillMode=process`, so the `apiclient` child
+survives the restart, and the restarted agent sees the setting already applied and does
+nothing.
 
-== Dev cluster RBAC
+== RBAC
 
-The managed `AmazonEKSAutoNodePolicy` does not grant the agent's identity
-(`eks-auto:node-monitoring-agent`) access to CNINodes. The agent only reads its CNINode, so
-it needs no write access. For a dev cluster:
+The agent's identity (`eks-auto:node-monitoring-agent`) needs read-only access to CNINodes:
+`get`, `list` and `watch` on `cninodes` in `eks.amazonaws.com`. For production, add this
+rule to `nmaRules` in EKSAccessEntryServiceLambdaPolicies. For a dev cluster:
 
 [source,yaml]
 ----
@@ -61,13 +68,11 @@ subjects:
   name: eks-auto:node-monitoring-agent
 ----
 
-For production, add the same read-only rule to `nmaRules` in EKSAccessEntryServiceLambdaPolicies.
-
 == Verifying on a node
 
 [source,bash]
 ----
-kubectl get cninode <node> -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/target-max-pods}'
+kubectl get cninode <node> -o wide        # MAXPODS column shows status.maxPods
 kubectl get node <node> -o jsonpath='{.status.allocatable.pods}'
 journalctl -u eks-node-monitoring-agent | grep -i "max pods"
 cat /var/lib/eks-node-monitoring-agent/max-pods.json

@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -38,13 +39,16 @@ type maxPodsHarness struct {
 	now        time.Time
 }
 
-func newMaxPodsHarness(t *testing.T, current int32, annotations map[string]string) *maxPodsHarness {
+// newMaxPodsHarness creates this node's CNINode with status.maxPods set to maxPods (any
+// JSON value, nil for unset) and kubelet configured with current max-pods.
+func newMaxPodsHarness(t *testing.T, current int32, maxPods any) *maxPodsHarness {
 	scheme := runtime.NewScheme()
 	scheme.AddKnownTypeWithName(CNINodeGVK, &unstructured.Unstructured{})
-	cniNode := &unstructured.Unstructured{}
-	cniNode.SetGroupVersionKind(CNINodeGVK)
+	cniNode := NewCNINode()
 	cniNode.SetName(testNodeName)
-	cniNode.SetAnnotations(annotations)
+	if maxPods != nil {
+		require.NoError(t, unstructured.SetNestedField(cniNode.Object, maxPods, "status", "maxPods"))
+	}
 
 	h := &maxPodsHarness{
 		t:        t,
@@ -64,21 +68,16 @@ func (h *maxPodsHarness) reconcile() reconcile.Result {
 	return result
 }
 
-func (h *maxPodsHarness) setTarget(value string) {
-	cniNode := NewCNINodeMetadata()
+// setMaxPods sets status.maxPods as the IPAM controller would; nil unsets it.
+func (h *maxPodsHarness) setMaxPods(maxPods any) {
+	cniNode := NewCNINode()
 	require.NoError(h.t, h.controller.kubeClient.Get(context.Background(), types.NamespacedName{Name: testNodeName}, cniNode))
-	patch := client.MergeFrom(cniNode.DeepCopy())
-	annotations := cniNode.GetAnnotations()
-	if value == "" {
-		delete(annotations, TargetMaxPodsAnnotation)
+	if maxPods == nil {
+		unstructured.RemoveNestedField(cniNode.Object, "status", "maxPods")
 	} else {
-		if annotations == nil {
-			annotations = map[string]string{}
-		}
-		annotations[TargetMaxPodsAnnotation] = value
+		require.NoError(h.t, unstructured.SetNestedField(cniNode.Object, maxPods, "status", "maxPods"))
 	}
-	cniNode.SetAnnotations(annotations)
-	require.NoError(h.t, h.controller.kubeClient.Patch(context.Background(), cniNode, patch))
+	require.NoError(h.t, h.controller.kubeClient.Update(context.Background(), cniNode))
 }
 
 func TestDecideMaxPods(t *testing.T) {
@@ -117,7 +116,7 @@ func TestParseApiclientMaxPods(t *testing.T) {
 }
 
 func TestMaxPodsRaises(t *testing.T) {
-	h := newMaxPodsHarness(t, 58, map[string]string{TargetMaxPodsAnnotation: "74"})
+	h := newMaxPodsHarness(t, 58, int64(74))
 	h.reconcile()
 	assert.Equal(t, []int32{74}, h.settings.sets)
 
@@ -127,40 +126,67 @@ func TestMaxPodsRaises(t *testing.T) {
 }
 
 func TestMaxPodsRateLimitsRaisesButNotLowers(t *testing.T) {
-	h := newMaxPodsHarness(t, 58, map[string]string{TargetMaxPodsAnnotation: "66"})
+	h := newMaxPodsHarness(t, 58, int64(66))
 	h.reconcile()
 
 	h.now = h.now.Add(30 * time.Second)
-	h.setTarget("82")
+	h.setMaxPods(int64(82))
 	assert.Equal(t, 90*time.Second, h.reconcile().RequeueAfter)
 	assert.Equal(t, []int32{66}, h.settings.sets)
 
-	h.setTarget("58")
+	h.setMaxPods(int64(58))
 	h.reconcile()
 	assert.Equal(t, []int32{66, 58}, h.settings.sets)
 }
 
-func TestMaxPodsRestoresBaselineWhenTargetRemoved(t *testing.T) {
-	h := newMaxPodsHarness(t, 58, map[string]string{TargetMaxPodsAnnotation: "74"})
+func TestMaxPodsRestoresBaselineWhenMaxPodsUnset(t *testing.T) {
+	h := newMaxPodsHarness(t, 58, int64(74))
 	h.reconcile()
 
-	h.setTarget("")
+	h.setMaxPods(nil)
 	h.reconcile()
 	assert.Equal(t, []int32{74, 58}, h.settings.sets)
 }
 
 func TestMaxPodsDoesNotReapplyAfterRestart(t *testing.T) {
 	// the apiclient commit restarted the agent after the setting was already applied.
-	h := newMaxPodsHarness(t, 74, map[string]string{TargetMaxPodsAnnotation: "74"})
+	h := newMaxPodsHarness(t, 74, int64(74))
 	require.NoError(t, h.controller.saveState(maxPodsState{Baseline: 58, Intent: 74, AppliedAt: h.now}))
 	h.reconcile()
 	assert.Empty(t, h.settings.sets)
 }
 
-func TestMaxPodsIgnoresMalformedTarget(t *testing.T) {
-	h := newMaxPodsHarness(t, 58, map[string]string{TargetMaxPodsAnnotation: "2500000000"})
-	h.reconcile()
-	assert.Empty(t, h.settings.sets)
+func TestMaxPodsIgnoresMalformedMaxPods(t *testing.T) {
+	for name, maxPods := range map[string]any{
+		"out of int32 range": int64(2500000000),
+		"zero":               int64(0),
+		"not a number":       "lots",
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newMaxPodsHarness(t, 58, maxPods)
+			h.reconcile()
+			assert.Empty(t, h.settings.sets)
+		})
+	}
+}
+
+func TestMaxPodsChangedPredicate(t *testing.T) {
+	withMaxPods := func(maxPods any) *unstructured.Unstructured {
+		obj := NewCNINode()
+		if maxPods != nil {
+			require.NoError(t, unstructured.SetNestedField(obj.Object, maxPods, "status", "maxPods"))
+		}
+		require.NoError(t, unstructured.SetNestedField(obj.Object, "eni-1", "status", "networkInterfaces"))
+		return obj
+	}
+	update := func(oldObj, newObj *unstructured.Unstructured) event.TypedUpdateEvent[client.Object] {
+		return event.TypedUpdateEvent[client.Object]{ObjectOld: oldObj, ObjectNew: newObj}
+	}
+	assert.True(t, maxPodsChanged(update(withMaxPods(int64(56)), withMaxPods(int64(64)))))
+	assert.True(t, maxPodsChanged(update(withMaxPods(int64(64)), withMaxPods(nil))))
+	newObj := withMaxPods(int64(64))
+	require.NoError(t, unstructured.SetNestedField(newObj.Object, "eni-2", "status", "networkInterfaces"))
+	assert.False(t, maxPodsChanged(update(withMaxPods(int64(64)), newObj)), "other status changes are ignored")
 }
 
 func TestMaxPodsLeavesUntouchedNodesAlone(t *testing.T) {

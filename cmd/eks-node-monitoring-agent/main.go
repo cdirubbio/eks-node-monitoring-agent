@@ -158,7 +158,7 @@ func run() error {
 	if enableDynamicMaxPods {
 		// only cache this node's CNINode, not every CNINode in the cluster.
 		cacheOptions.ByObject = map[client.Object]cache.ByObject{
-			controllers.NewCNINodeMetadata(): {Field: fields.OneTermEqualSelector("metadata.name", hostname)},
+			controllers.NewCNINode(): {Field: fields.OneTermEqualSelector("metadata.name", hostname)},
 		}
 	}
 
@@ -500,7 +500,7 @@ func parseFlags() error {
 	flagSet.StringVar(&controllerMetricsAddress, "metrics-address", ":8080", "Address for the controller runtime metrics endpoint")
 	flagSet.StringVar(&controllerPprofAddress, "pprof-address", "", "Address for the controller runtime pprof endpoint (default disabled)")
 	flagSet.IntVarP(&verbosity, "verbosity", "v", 2, "Logging verbosity level")
-	flagSet.BoolVar(&dynamicMaxPods, "dynamic-max-pods", false, "Apply the max-pods target the EKS Auto IPAM controller publishes on this node's CNINode (EKS Auto only)")
+	flagSet.BoolVar(&dynamicMaxPods, "dynamic-max-pods", false, "Apply the max-pods the EKS Auto IPAM controller publishes in this node's CNINode status.maxPods (EKS Auto only; enabled by settings.advanced-networking.dynamic-max-pods)")
 	flagSet.StringVar(&dynamicMaxPodsStatePath, "dynamic-max-pods-state-path", controllers.DefaultMaxPodsStatePath, "File that persists the boot max-pods baseline and the last applied value")
 	flagSet.DurationVar(&dynamicMaxPodsMinInterval, "dynamic-max-pods-min-interval", controllers.DefaultMaxPodsMinInterval, "Minimum time between max-pods raises; each change restarts kubelet")
 	flagSet.StringVar(&apiclientPath, "apiclient-path", "/usr/bin/apiclient", "Path to the Bottlerocket apiclient binary")
