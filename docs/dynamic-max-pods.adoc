@@ -28,14 +28,11 @@ math they no longer need.
 
 Raises are rate limited by `--dynamic-max-pods-min-interval` (default 2m). Lowers and
 restoring the baseline are never rate limited. A malformed `status.maxPods` is ignored.
-When `status.maxPods` is unset, for example because the IPAMC `DynamicMaxPods` feature gate
-was turned off, the agent restores the baseline.
+When `status.maxPods` is unset, the agent restores the baseline.
 
-NOTE: A `settings.kubernetes.max-pods` commit restarts kubelet. Until the AMI scopes that
-setting to kubelet, it also restarts the other services registered under `kubernetes`,
-including this agent. The agent unit uses `KillMode=process`, so the `apiclient` child
-survives the restart, and the restarted agent sees the setting already applied and does
-nothing.
+NOTE: A `settings.kubernetes.max-pods` commit restarts kubelet only on AMIs that map it to the
+`kubelet-max-pods` service; older AMIs also restart this agent. The agent persists its intent
+first and, after a restart, sees the setting already applied and does nothing.
 
 == RBAC
 
